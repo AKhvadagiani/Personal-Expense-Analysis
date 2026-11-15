@@ -7,7 +7,12 @@ authors = [
     { name = "Ani Khvadagiani", email = "anikhvadagiani12@gmail.com" }
 ]
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "duckdb>=2.0.0",
+    "pandas>=2.2.0",
+    "pdfplumber>=0.11.0",
+    "prefect>=3.9.3",
+]
 
 [project.scripts]
 personal-expense-analysis = "personal_expense_analysis:main"
