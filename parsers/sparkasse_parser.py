@@ -2,11 +2,13 @@
 import argparse
 from datetime import datetime
 from decimal import Decimal
+from hashlib import sha256
 from pathlib import Path
 import re
 
 import pandas as pd
 import pdfplumber
+import duckdb
 
 COLUMNS = ['transaction date', 'expense amount', 'currency', 'expense description', 'location', 'bank']
 AMOUNT = r'[+-]?(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2}'
@@ -14,6 +16,7 @@ TRANSACTION = re.compile(rf'^(\d{{2}}\.\d{{2}}\.\d{{4}})\s*(.+?)\s+({AMOUNT})$')
 BALANCE = re.compile(rf'^(Kontostand am.*?|Übertrag:)\s+({AMOUNT})$')
 HEADER = 'Datum Erläuterung Betrag EUR'
 DEFAULT_DIRECTORY = Path(__file__).resolve().parents[1] / 'expenses' / 'sparkasse'
+DEFAULT_DATABASE = Path(__file__).resolve().parents[1] / 'data' / 'database' / 'expenses.duckdb'
 
 
 def money(value: str) -> Decimal:
@@ -125,6 +128,55 @@ class SparkasseParser:
             return self.parse([page.extract_text() or '' for page in pdf.pages])
 
 
+def write_expenses(frame: pd.DataFrame, source_pdf: Path,
+                   database: Path = DEFAULT_DATABASE) -> int:
+    """Append a complete statement atomically, skipping already imported PDFs.
+
+    Track file content separately so identical legitimate transactions within
+    a statement are preserved while rerunning the script does not duplicate it.
+    """
+    digest = sha256(source_pdf.read_bytes()).hexdigest()
+    database.parent.mkdir(parents=True, exist_ok=True)
+    with duckdb.connect(str(database)) as connection:
+        connection.execute('BEGIN TRANSACTION')
+        try:
+            connection.execute('''
+                CREATE TABLE IF NOT EXISTS sparkasse_tranasctions (
+                    "transaction date" DATE,
+                    "expense amount" DECIMAL(18, 2),
+                    currency VARCHAR,
+                    "expense description" VARCHAR,
+                    location VARCHAR,
+                    bank VARCHAR
+                )
+            ''')
+            connection.execute('''
+                CREATE TABLE IF NOT EXISTS sparkasse_imports (
+                    pdf_sha256 VARCHAR PRIMARY KEY,
+                    source_file VARCHAR NOT NULL,
+                    row_count BIGINT NOT NULL,
+                    imported_at TIMESTAMP DEFAULT current_timestamp
+                )
+            ''')
+            exists = connection.execute(
+                'SELECT 1 FROM sparkasse_imports WHERE pdf_sha256 = ?', [digest]
+            ).fetchone()
+            if exists:
+                connection.execute('COMMIT')
+                return 0
+            connection.register('parsed_expenses', frame[COLUMNS])
+            connection.execute('INSERT INTO sparkasse_tranasctions BY NAME SELECT * FROM parsed_expenses')
+            connection.execute(
+                'INSERT INTO sparkasse_imports (pdf_sha256, source_file, row_count) VALUES (?, ?, ?)',
+                [digest, source_pdf.name, len(frame)],
+            )
+            connection.execute('COMMIT')
+        except Exception:
+            connection.execute('ROLLBACK')
+            raise
+    return len(frame)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('pdf', nargs='?', type=Path, help='PDF to parse; defaults to the first Sparkasse PDF')
@@ -136,7 +188,11 @@ def main() -> None:
             parser.error(f'No PDFs found in {DEFAULT_DIRECTORY}')
         path = files[0]
     frame = SparkasseParser().parse_pdf(path)
+    inserted = write_expenses(frame, path)
     print(frame.head().to_string(index=False))
+    print(f'Imported {inserted} of {len(frame)} rows into {DEFAULT_DATABASE} (sparkasse_tranasctions table).')
+    if inserted == 0:
+        print('This PDF has already been imported, or contains no transactions.')
 
 
 if __name__ == '__main__':
