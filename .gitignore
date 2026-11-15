@@ -3,6 +3,10 @@
 
 # Virtual environments
 .venv/
+.parser-venv/
+.python/
+.cache/
+/tmp/pdfs/
 venv/
 env/
 
